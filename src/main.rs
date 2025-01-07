@@ -1,12 +1,13 @@
 use core::str;
 use crossterm::event::{poll, read, Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, Clear, ClearType};
+use crossterm::terminal::{self, disable_raw_mode, Clear, ClearType};
 use crossterm::terminal::{enable_raw_mode, size};
-use crossterm::{cursor, execute, queue};
+use crossterm::{cursor, execute, queue, style};
 use std::cmp::Ordering;
-use std::io::{stdout, ErrorKind, Result, Write};
-use std::path::Path;
-use std::time::Duration;
+use std::fs::OpenOptions;
+use std::io::{stdout, Error, ErrorKind, Result, Write};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use std::{cmp, env, fs};
 
 struct Reader;
@@ -76,6 +77,27 @@ impl Editor {
                     })
                 })
             }
+            KeyEvent {
+                code: KeyCode::Char('s'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.output.editor_rows.save().map(|len| {
+                self.output
+                    .status_message
+                    .set_message(format!("{} bytes written to disk", len));
+                self.output.dirty = 0;
+            })?,
+            KeyEvent {
+                code: code @ (KeyCode::Char(..) | KeyCode::Tab),
+                modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
+                ..
+            } => {
+                self.output.insert_char(match code {
+                    KeyCode::Tab => '\t',
+                    KeyCode::Char(ch) => ch,
+                    _ => unreachable!(),
+                });
+            }
             _ => {}
         }
         Ok(true)
@@ -96,23 +118,30 @@ impl Drop for CleanUp {
     }
 }
 
+#[derive(Default)]
 struct Row {
-    row_content: Box<str>,
+    row_content: String,
     render: String,
 }
 
 impl Row {
-    fn new(row_content: Box<str>, render: String) -> Self {
+    fn new(row_content: String, render: String) -> Self {
         Self {
             row_content,
             render,
         }
+    }
+
+    fn insert_char(&mut self, at: usize, ch: char) {
+        self.row_content.insert(at, ch);
+        EditorRows::render_row(self);
     }
 }
 
 const TAB_STOP: usize = 8;
 struct EditorRows {
     row_contents: Vec<Row>,
+    filename: Option<PathBuf>,
 }
 
 impl EditorRows {
@@ -122,14 +151,16 @@ impl EditorRows {
         match arg.nth(1) {
             None => Self {
                 row_contents: Vec::new(),
+                filename: None,
             },
-            Some(file) => Self::from_file(file.as_ref()),
+            Some(file) => Self::from_file(file.into()),
         }
     }
 
-    fn from_file(file: &Path) -> Self {
-        let file_contents = fs::read_to_string(file).expect("Unable to read file");
+    fn from_file(file: PathBuf) -> Self {
+        let file_contents = fs::read_to_string(&file).expect("Unable to read file");
         Self {
+            filename: Some(file),
             row_contents: file_contents
                 .lines()
                 .map(|it| {
@@ -153,6 +184,10 @@ impl EditorRows {
         &self.row_contents[at]
     }
 
+    fn get_editor_row_mut(&mut self, at: usize) -> &mut Row {
+        &mut self.row_contents[at]
+    }
+
     fn render_row(row: &mut Row) {
         let mut index = 0;
         let capacity = row
@@ -172,6 +207,28 @@ impl EditorRows {
                 row.render.push(c);
             }
         });
+    }
+
+    fn insert_row(&mut self) {
+        self.row_contents.push(Row::default());
+    }
+
+    fn save(&self) -> Result<usize> {
+        match &self.filename {
+            None => Err(Error::new(ErrorKind::Other, "no file name specified")),
+            Some(name) => {
+                let mut file = OpenOptions::new().write(true).create(true).open(name)?;
+                let contents: String = self
+                    .row_contents
+                    .iter()
+                    .map(|it| it.row_content.as_str())
+                    .collect::<Vec<&str>>()
+                    .join("\n");
+                file.set_len(contents.len() as u64)?;
+                file.write_all(contents.as_bytes())?;
+                Ok(contents.as_bytes().len())
+            }
+        }
     }
 }
 
@@ -219,6 +276,8 @@ struct Output {
     editor_contents: EditorContents,
     cursor_controller: CursorController,
     editor_rows: EditorRows,
+    status_message: StatusMessage,
+    dirty: u64,
 }
 
 struct CursorController {
@@ -283,7 +342,7 @@ impl CursorController {
                 if self.cursor_y < num_of_rows {
                     self.cursor_x = editor_rows.get_render(self.cursor_y).len();
                 }
-            },
+            }
             KeyCode::Home => self.cursor_x = 0,
             _ => unimplemented!(),
         }
@@ -327,13 +386,15 @@ impl CursorController {
 
 impl Output {
     fn new() -> Self {
-        let win_size = size().map(|(x, y)| (x as usize, y as usize)).unwrap();
+        let win_size = size().map(|(x, y)| (x as usize, y as usize - 2)).unwrap();
 
         Self {
             win_size,
             editor_contents: EditorContents::new(),
             cursor_controller: CursorController::new(win_size),
             editor_rows: EditorRows::new(),
+            status_message: StatusMessage::new("HELP: Ctrl-S = Save | Ctrl-Q = Quit".into()),
+            dirty: 0,
         }
     }
 
@@ -346,6 +407,8 @@ impl Output {
         self.cursor_controller.scroll(&self.editor_rows);
         queue!(self.editor_contents, cursor::Hide, cursor::MoveTo(0, 0))?;
         self.draw_rows();
+        self.draw_status_bar();
+        self.draw_message_bar();
         let cursor_x = self.cursor_controller.render_x - self.cursor_controller.column_offset;
         let cursor_y = self.cursor_controller.cursor_y - self.cursor_controller.row_offset;
         queue!(
@@ -388,15 +451,102 @@ impl Output {
             }
 
             queue!(self.editor_contents, Clear(ClearType::UntilNewLine)).unwrap();
-            if i < screen_rows - 1 {
-                self.editor_contents.push_str("\r\n");
-            }
+            self.editor_contents.push_str("\r\n");
         }
     }
 
     fn move_cursor(&mut self, direction: KeyCode) {
         self.cursor_controller
             .move_cursor(direction, &self.editor_rows);
+    }
+
+    fn draw_status_bar(&mut self) {
+        self.editor_contents
+            .push_str(&style::Attribute::Reverse.to_string());
+        let info = format!(
+            "{} {} -- {} lines",
+            self.editor_rows
+                .filename
+                .as_ref()
+                .and_then(|path| path.file_name().and_then(|name| name.to_str()))
+                .unwrap_or("[No Name]"),
+            if self.dirty > 0 { "(modified)" } else { "" },
+            self.editor_rows.number_of_rows()
+        );
+        let info_len = cmp::min(info.len(), self.win_size.0);
+        let line_info = format!(
+            "{}/{}",
+            self.cursor_controller.cursor_y + 1,
+            self.editor_rows.number_of_rows()
+        );
+        self.editor_contents.push_str(&info[..info_len]);
+        for i in info_len..self.win_size.0 {
+            if self.win_size.0 - i == line_info.len() {
+                self.editor_contents.push_str(&line_info);
+                break;
+            } else {
+                self.editor_contents.push(' ');
+            }
+        }
+        self.editor_contents
+            .push_str(&style::Attribute::Reset.to_string());
+        self.editor_contents.push_str("\r\n");
+    }
+
+    fn draw_message_bar(&mut self) {
+        queue!(
+            self.editor_contents,
+            terminal::Clear(ClearType::UntilNewLine)
+        )
+        .unwrap();
+        if let Some(msg) = self.status_message.message() {
+            self.editor_contents
+                .push_str(&msg[..cmp::min(self.win_size.0, msg.len())]);
+        }
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        if self.cursor_controller.cursor_y == self.editor_rows.number_of_rows() {
+            self.editor_rows.insert_row();
+            self.dirty += 1;
+        }
+
+        self.editor_rows
+            .get_editor_row_mut(self.cursor_controller.cursor_y)
+            .insert_char(self.cursor_controller.cursor_x, ch);
+        self.cursor_controller.cursor_x += 1;
+        self.dirty += 1;
+    }
+}
+
+struct StatusMessage {
+    message: Option<String>,
+    set_time: Option<Instant>,
+}
+
+impl StatusMessage {
+    fn new(initial_message: String) -> Self {
+        Self {
+            message: Some(initial_message),
+            set_time: Some(Instant::now()),
+        }
+    }
+
+    fn set_message(&mut self, message: String) {
+        self.message = Some(message);
+        self.set_time = Some(Instant::now())
+    }
+
+    fn message(&mut self) -> Option<&String> {
+        self.set_time.and_then(|time| {
+            if time.elapsed() > Duration::from_secs(5) {
+                self.message = None;
+                self.set_time = None;
+                None
+            } else {
+                Some(self.message.as_ref().unwrap())
+            }
+        })
     }
 }
 
