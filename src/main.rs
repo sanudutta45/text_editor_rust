@@ -102,6 +102,16 @@ impl Editor {
                 self.output.dirty = 0;
             })?,
             KeyEvent {
+                code: key @ (KeyCode::Backspace | KeyCode::Delete),
+                modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
+                ..
+            } => {
+                if matches!(key, KeyCode::Delete) {
+                    self.output.move_cursor(KeyCode::Right);
+                }
+                self.output.delete_char();
+            }
+            KeyEvent {
                 code: code @ (KeyCode::Char(..) | KeyCode::Tab),
                 modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
                 ..
@@ -112,6 +122,11 @@ impl Editor {
                     _ => unreachable!(),
                 });
             }
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.output.insert_newline(),
             _ => {}
         }
         self.quit_times = QUIT_TIMES;
@@ -149,6 +164,11 @@ impl Row {
 
     fn insert_char(&mut self, at: usize, ch: char) {
         self.row_content.insert(at, ch);
+        EditorRows::render_row(self);
+    }
+
+    fn delete_char(&mut self, at: usize) {
+        self.row_content.remove(at);
         EditorRows::render_row(self);
     }
 }
@@ -224,8 +244,10 @@ impl EditorRows {
         });
     }
 
-    fn insert_row(&mut self) {
-        self.row_contents.push(Row::default());
+    fn insert_row(&mut self, at: usize, contents: String) {
+        let mut new_row = Row::new(contents, String::new());
+        EditorRows::render_row(&mut new_row);
+        self.row_contents.insert(at, new_row);
     }
 
     fn save(&self) -> Result<usize> {
@@ -244,6 +266,13 @@ impl EditorRows {
                 Ok(contents.as_bytes().len())
             }
         }
+    }
+
+    fn join_adjacent_rows(&mut self, at: usize) {
+        let current_row = self.row_contents.remove(at);
+        let previous_row = self.get_editor_row_mut(at - 1);
+        previous_row.row_content.push_str(&current_row.row_content);
+        Self::render_row(previous_row);
     }
 }
 
@@ -522,7 +551,8 @@ impl Output {
 
     fn insert_char(&mut self, ch: char) {
         if self.cursor_controller.cursor_y == self.editor_rows.number_of_rows() {
-            self.editor_rows.insert_row();
+            self.editor_rows
+                .insert_row(self.editor_rows.number_of_rows(), String::new());
             self.dirty += 1;
         }
 
@@ -530,6 +560,56 @@ impl Output {
             .get_editor_row_mut(self.cursor_controller.cursor_y)
             .insert_char(self.cursor_controller.cursor_x, ch);
         self.cursor_controller.cursor_x += 1;
+        self.dirty += 1;
+    }
+
+    fn delete_char(&mut self) {
+        if self.cursor_controller.cursor_y == self.editor_rows.number_of_rows() {
+            return;
+        }
+        if self.cursor_controller.cursor_y == 0 && self.cursor_controller.cursor_x == 0 {
+            return;
+        }
+
+        let row = self
+            .editor_rows
+            .get_editor_row_mut(self.cursor_controller.cursor_y);
+        if self.cursor_controller.cursor_x > 0 {
+            row.delete_char(self.cursor_controller.cursor_x - 1);
+            self.cursor_controller.cursor_x -= 1;
+        } else {
+            let previous_row_content = &self
+                .editor_rows
+                .get_editor_row(self.cursor_controller.cursor_y - 1)
+                .row_content;
+            self.cursor_controller.cursor_x = previous_row_content.len();
+            self.editor_rows
+                .join_adjacent_rows(self.cursor_controller.cursor_y);
+            self.cursor_controller.cursor_y -= 1;
+        }
+        self.dirty += 1;
+    }
+
+    fn insert_newline(&mut self) {
+        if self.cursor_controller.cursor_x == 0 {
+            self.editor_rows
+                .insert_row(self.cursor_controller.cursor_y, String::new());
+        } else {
+            let current_row = self
+                .editor_rows
+                .get_editor_row_mut(self.cursor_controller.cursor_y);
+            let new_row_content: String =
+                current_row.row_content[self.cursor_controller.cursor_x..].into();
+
+            current_row
+                .row_content
+                .truncate(self.cursor_controller.cursor_x);
+            EditorRows::render_row(current_row);
+            self.editor_rows
+                .insert_row(self.cursor_controller.cursor_y + 1, new_row_content);
+        }
+        self.cursor_controller.cursor_x = 0;
+        self.cursor_controller.cursor_y += 1;
         self.dirty += 1;
     }
 }
